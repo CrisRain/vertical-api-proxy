@@ -54,9 +54,9 @@ BASE_HEADERS = {
 # --- 文本模型映射 ---
 # 键是客户端（如OpenAI兼容客户端）发送的模型名称，值是Vertical Studio AI实际使用的模型ID
 MODEL_MAPPING = {
-    "claude-3-7-sonnet": "claude-3-7-sonnet-20250219",
-    "claude-4-sonnet": "claude-4-sonnet-20250514",
-    "claude-4-opus": "claude-4-opus-20250219",
+    "claude-3-7-sonnet-thinking": "claude-3-7-sonnet-20250219",
+    "claude-4-sonnet-thinking": "claude-4-sonnet-20250514",
+    "claude-4-opus-thinking": "claude-4-opus-20250514",
     "deepseek-r1": "deepseek-reasoner",
     "deepseek-v3": "deepseek-chat",
     "gemini-2.5-flash-preview": "gemini-2.5-flash-preview-04-17",
@@ -156,20 +156,26 @@ def login_and_get_cookies(email, password):
     app.logger.info("正在尝试登录...")
     try:
         # 使用全局 session 进行请求
-        response = GLOBAL_REQUEST_SESSION.get(LOGIN_URL, headers=login_page_headers, allow_redirects=True, timeout=15)
+        # 开启stream模式，对于不需要响应体的请求，通过读取response.content确保连接被释放
+        response = GLOBAL_REQUEST_SESSION.get(LOGIN_URL, headers=login_page_headers, allow_redirects=True, timeout=15, stream=True)
         if response.status_code not in [200, 202, 302]:
             app.logger.error(f"访问登录页面失败，状态码: {response.status_code}")
+            _ = response.content # 消耗响应体
             return False
+        _ = response.content # 消耗响应体
 
         email_encoded = urlencode({"email": email}, encoding='utf-8').split("=")[1]
         login_password_data_url_with_email = f"{LOGIN_PASSWORD_DATA_URL}?email={email_encoded}"
-        response = GLOBAL_REQUEST_SESSION.get(login_password_data_url_with_email, headers=data_url_headers, allow_redirects=True, timeout=15)
+        response = GLOBAL_REQUEST_SESSION.get(login_password_data_url_with_email, headers=data_url_headers, allow_redirects=True, timeout=15, stream=True)
         if response.status_code not in [200, 202, 302]:
             app.logger.error(f"访问 login-password.data 失败，状态码: {response.status_code}")
+            _ = response.content # 消耗响应体
             return False
+        _ = response.content # 消耗响应体
 
         form_data = {"email": email, "password": password}
-        response = GLOBAL_REQUEST_SESSION.post(login_password_data_url_with_email, data=urlencode(form_data, encoding='utf-8'), headers=post_login_headers, allow_redirects=True, timeout=15)
+        # post请求后会读取response.text，所以不需要手动消耗
+        response = GLOBAL_REQUEST_SESSION.post(login_password_data_url_with_email, data=urlencode(form_data, encoding='utf-8'), headers=post_login_headers, allow_redirects=True, timeout=15, stream=True)
 
         # requests.Session 会自动管理 cookies，我们只需检查是否登录成功
         # 通过检查响应或CookieJar中是否存在特定的认证cookie
@@ -252,19 +258,20 @@ def create_new_chat_session(corner_type=TEXT_CORNER_TYPE):
         
         # 模拟一系列用户操作来获取一个新的会话ID
         # 所有请求都通过 GLOBAL_REQUEST_SESSION 发出
-        GLOBAL_REQUEST_SESSION.get(STREAM_BASE_URL, headers=current_headers, allow_redirects=True, timeout=10)
+        # 开启stream模式，对于“即发即弃”的请求，立即消耗其响应体以释放连接
+        _ = GLOBAL_REQUEST_SESSION.get(STREAM_BASE_URL, headers=current_headers, allow_redirects=True, timeout=10, stream=True).content
         
         headers_for_post_stream_data = current_headers.copy()
         headers_for_post_stream_data["Content-Type"] = "application/x-www-form-urlencoded;charset=UTF-8"
         dummy_prompt_val = str(uuid.uuid4())
         post_form_data = {"prompt": dummy_prompt_val, "intent": "execute-prompt"}
         stream_data_url_with_query = f"{STREAM_DATA_URL}?searchType=studio"
-        GLOBAL_REQUEST_SESSION.post(stream_data_url_with_query, data=urlencode(post_form_data, encoding='utf-8'), headers=headers_for_post_stream_data, allow_redirects=True, timeout=10)
+        _ = GLOBAL_REQUEST_SESSION.post(stream_data_url_with_query, data=urlencode(post_form_data, encoding='utf-8'), headers=headers_for_post_stream_data, allow_redirects=True, timeout=10, stream=True).content
         
-        # 这是获取新Chat ID的关键请求
+        # 这是获取新Chat ID的关键请求, 后续会读取response，所以不需要手动消耗
         headers_for_get_corner_data = current_headers.copy() # GET 请求不需要 Content-Type
         specific_corner_data_url = f"{STREAM_CORNERS_BASE_URL}/{corner_type}.data?prompt={dummy_prompt_val}"
-        response = GLOBAL_REQUEST_SESSION.get(specific_corner_data_url, headers=headers_for_get_corner_data, allow_redirects=False, timeout=10)
+        response = GLOBAL_REQUEST_SESSION.get(specific_corner_data_url, headers=headers_for_get_corner_data, allow_redirects=False, timeout=10, stream=True)
         
         new_chat_id = None
         # VS AI 通过重定向(Location头)或在响应体中返回新的会话URL，我们需要从中解析出Chat ID
@@ -330,21 +337,32 @@ def make_request_with_retry(method, url, headers=None, json_data=None, data=None
             timeout_config = (10, 120) if stream or method.upper() == "POST" else (10,30)
 
             # 所有请求都通过 GLOBAL_REQUEST_SESSION 发出
+            # 内部强制使用 stream=True 来控制连接，根据函数参数 stream 决定是否立即消耗响应体
             if method.upper() == "POST":
-                response = GLOBAL_REQUEST_SESSION.post(url, headers=current_headers, json=json_data, data=data, stream=stream, timeout=timeout_config)
+                response = GLOBAL_REQUEST_SESSION.post(url, headers=current_headers, json=json_data, data=data, stream=True, timeout=timeout_config)
             else: # GET
-                response = GLOBAL_REQUEST_SESSION.get(url, headers=current_headers, stream=stream, timeout=timeout_config)
+                response = GLOBAL_REQUEST_SESSION.get(url, headers=current_headers, stream=True, timeout=timeout_config)
 
-            if response.status_code in [200, 202, 302]: return response
+            if response.status_code in [200, 202, 302]:
+                if not stream:
+                    _ = response.content # 如果调用者不处理流，我们在这里消耗它以释放连接
+                return response
             # 如果是401/403，并且我们有全局session，尝试重新登录会更新全局session的cookies
             elif response.status_code in [401, 403]:
+                _ = response.content # 消耗响应体
                 app.logger.warning(f"认证失败 (状态码 {response.status_code}) for {url}，尝试重新登录...")
                 email, password = load_credentials()
                 if email and password and login_and_get_cookies(email, password):
                     app.logger.info("重新登录成功，正在重试原始请求...")
                     continue # 继续下一次循环以重试
-                else: app.logger.error("重新登录失败或无凭据。"); return response
-            app.logger.warning(f"请求 {url} 失败，状态码: {response.status_code}，响应: {response.text[:200] if response.content else 'No content'}...")
+                else:
+                    app.logger.error("重新登录失败或无凭据。")
+                    # 虽然登录失败，但原始的response对象已经消耗，这里可以安全地返回一个新错误或None
+                    return None # 或者可以构造一个表示认证失败的Response对象
+            
+            # 对于其他错误，消耗响应体并记录日志
+            response_text_preview = response.text[:200] if response.content else 'No content'
+            app.logger.warning(f"请求 {url} 失败，状态码: {response.status_code}，响应: {response_text_preview}...")
         except requests.exceptions.Timeout: app.logger.warning(f"请求超时: {url}...")
         except requests.exceptions.ConnectionError as e: app.logger.error(f"请求连接错误 for {url}: {e}")
         except requests.exceptions.RequestException as e: app.logger.error(f"一般请求异常 for {url}: {e}")
@@ -419,6 +437,18 @@ def generate_stream_done(model, message_id):
                  "choices": [{"delta": {}, "index": 0, "finish_reason": "stop"}]}
     return f"data: {json.dumps(done_data)}\n\n"
 
+def generate_stream_reasoning_response(reasoning_chunk, model, message_id):
+    """
+    为“思考”内容生成一个符合OpenAI格式的流式响应数据块。
+    :param reasoning_chunk: AI生成的思考内容块。
+    :param model: 使用的模型名称。
+    :param message_id: OpenAI格式的消息ID。
+    :return: 格式化后的SSE事件字符串。
+    """
+    chunk_data = {"id": message_id, "object": "chat.completion.chunk", "created": int(time.time()), "model": model,
+                  "choices": [{"delta": {"reasoning_content": reasoning_chunk}, "index": 0, "finish_reason": None}]}
+    return f"data: {json.dumps(chunk_data)}\n\n"
+
 def build_prompt_with_history_and_instructions(messages_array):
     """
     根据OpenAI格式的消息历史记录，构建一个适用于Vertical Studio AI的单一字符串提示。
@@ -470,113 +500,122 @@ def chat_completions():
     client_messages = data.get("messages", [])
     model_requested = data.get("model", list(MODEL_MAPPING.keys())[0])
     stream = data.get("stream", True)
-    temp_vs_chat_id = None # 用于确保在请求结束时删除临时会话
+    temp_vs_chat_id = None
+    # 引入一个标志来控制清理逻辑的执行
+    cleanup_in_finally = True
 
     try:
         if not client_messages: return jsonify({"error": "未提供消息"}), 400
-        # 将OpenAI格式的消息历史构建为VS AI所需的单个提示
-        system_prompt_content,final_prompt_for_vs_ai = build_prompt_with_history_and_instructions(client_messages)
+        system_prompt_content, final_prompt_for_vs_ai = build_prompt_with_history_and_instructions(client_messages)
 
-        # 为本次请求创建一个临时的VS AI会话
         temp_vs_chat_id = create_new_chat_session(corner_type=TEXT_CORNER_TYPE)
         if not temp_vs_chat_id: return jsonify({"error": "创建文本聊天会话失败"}), 500
-        
-        # 生成符合OpenAI和VS AI格式的消息ID
+
         openai_msg_id = f"chatcmpl-{uuid.uuid4().hex}"
         vs_msg_id = str(uuid.uuid4()).replace("-", "")[:16]
-        # 调整 createdAt 格式为以 'Z' 结尾
         created_at = datetime.now(timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
         
-        # 记录会话ID和消息ID的映射关系
         CHAT_IDS.setdefault(temp_vs_chat_id, []).append({"type": "text", "openai_id": openai_msg_id, "vs_id": vs_msg_id, "timestamp": created_at})
         SESSIONS[temp_vs_chat_id] = {"prompt_sent_preview": final_prompt_for_vs_ai[:100], "model_requested": model_requested}
 
-        # 将客户端请求的模型名称映射到VS AI的实际模型ID
         vs_text_model_id = MODEL_MAPPING.get(model_requested, list(MODEL_MAPPING.values())[0])
 
-        # 构建发送给VS AI聊天API的载荷
         target_payload = {
             "message": {"id": vs_msg_id, "createdAt": created_at, "role": "user", "content": final_prompt_for_vs_ai, "parts": [{"type": "text", "text": final_prompt_for_vs_ai}]},
             "cornerType": TEXT_CORNER_TYPE, "chatId": temp_vs_chat_id,
-            "settings": {
-                "modelId": vs_text_model_id,  # 修正字段名称： textModelId -> modelId
-                "customSystemPrompt": system_prompt_content
-                # "toneOfVoice": "default",
-                # "systemPromptPreset": "default"  # 新增字段
-            }
+            "settings": {"modelId": vs_text_model_id, "customSystemPrompt": system_prompt_content}
         }
-
-        # reasoning 字段的添加逻辑保持不变，基于 vs_text_model_id
-        if vs_text_model_id == "claude-4-sonnet-20250514" or MODEL_MAPPING.get(model_requested) == "claude-4-sonnet-20250514": # 确保使用正确的模型ID判断
+        if vs_text_model_id == "claude-4-sonnet-20250514" or vs_text_model_id == "claude-3-7-sonnet-20250219" or vs_text_model_id == "claude-4-opus-20250514":
             target_payload["settings"]["reasoning"] = "on"
 
         headers_for_chat = BASE_HEADERS.copy()
         headers_for_chat["Content-Type"] = "application/json"
-        # 模拟浏览器行为，设置Referer头
         headers_for_chat["Referer"] = f"{STREAM_CORNERS_BASE_URL}/{TEXT_CORNER_TYPE}/{temp_vs_chat_id}"
         
-        # 发送请求到VS AI，始终请求流式响应以便统一处理
         response_from_vs_ai = make_request_with_retry("POST", CHAT_API_URL, headers=headers_for_chat, json_data=target_payload, stream=True)
         if response_from_vs_ai is None or response_from_vs_ai.status_code != 200:
             err_text = response_from_vs_ai.text[:200] if response_from_vs_ai and response_from_vs_ai.content else "No response object or content"
             err_status = response_from_vs_ai.status_code if response_from_vs_ai else "N/A"
             return jsonify({"error": f"VS AI API 文本聊天请求失败，状态: {err_status}, 响应预览: {err_text}"}), 500
 
-        # 根据客户端是否要求流式响应，返回不同格式的数据
         if stream:
-            return Response(_handle_stream_response(response_from_vs_ai, model_requested, openai_msg_id), mimetype="text/event-stream")
+            # 对于流式响应，将清理责任转移给包装生成器
+            cleanup_in_finally = False
+            return Response(_stream_and_cleanup_session(response_from_vs_ai, model_requested, openai_msg_id, temp_vs_chat_id), mimetype="text/event-stream")
         else:
-            ai_reply_full = _handle_non_stream_response(response_from_vs_ai)
-            openai_response = {"id": openai_msg_id, "object": "chat.completion", "created": int(time.time()), "model": model_requested,
-                               "choices": [{"message": {"role": "assistant", "content": ai_reply_full}, "index": 0, "finish_reason": "stop"}],
-                               "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}} # usage是哑值
+            # 对于非流式响应，在此处完成所有工作，然后由finally块进行清理
+            ai_reply_full, reasoning_content = _handle_non_stream_response(response_from_vs_ai)
+            # 构建标准的message对象
+            message_obj = {"role": "assistant", "content": ai_reply_full}
+            # 如果存在思考内容，则将其添加到message对象中
+            if reasoning_content:
+                message_obj["reasoning_content"] = reasoning_content
+                
+            openai_response = {
+                "id": openai_msg_id,
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": model_requested,
+                "choices": [{"message": message_obj, "index": 0, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0} # usage是哑值
+            }
             return jsonify(openai_response)
     except Exception as e:
         app.logger.error(f"处理 /v1/chat/completions 时发生异常: {e}", exc_info=True)
         return jsonify({"error": f"内部服务器错误: {str(e)}"}), 500
     finally:
-        # 确保无论成功失败，都尝试删除此次请求创建的临时会话
-        if temp_vs_chat_id: delete_chat_session(temp_vs_chat_id)
+        # 仅当清理责任未被转移时，才在此处执行清理
+        if temp_vs_chat_id and cleanup_in_finally:
+            delete_chat_session(temp_vs_chat_id)
 
 def _parse_vs_ai_stream(response_from_vs_ai):
     """
     一个生成器，用于解析来自 Vertical Studio AI 的服务器发送事件(SSE)流。
-    该函数迭代响应行，解码它们，并从以 "0:" 开头的行中提取内容块。
-    它会 yield 每个内容块，直到遇到流结束标记 ("e:" 或 "d:")。
-
+    它会根据行的前缀 ("0:", "g:") 区分内容类型，并 yield 一个元组 (type, content)。
+    
     :param response_from_vs_ai: 来自 requests 库的响应对象，其内容是SSE流。
-    :return: 一个生成器，逐个 yield 内容字符串块。
+    :return: 一个生成器，逐个 yield 元组 (type, content_chunk)。
     """
     for line in response_from_vs_ai.iter_lines():
         if not line:
             continue
         decoded_line = line.decode('utf-8')
-        # 调试日志记录原始SSE行
         app.logger.debug(f"VS AI Raw SSE: {decoded_line}")
+        
+        content_to_parse = None
+        content_type = None
+
         if decoded_line.startswith("0:"):
+            content_type = "content"
+            content_to_parse = decoded_line[2:]
+        elif decoded_line.startswith("g:"):
+            content_type = "reasoning"
+            content_to_parse = decoded_line[2:]
+        elif decoded_line.startswith(("e:", "d:")):
+            app.logger.info("VS AI SSE stream finished.")
+            return
+
+        if content_to_parse:
             try:
                 # 提取并解码JSON编码的内容块
-                content_chunk = json.loads(decoded_line[2:])
-                yield content_chunk
+                chunk = json.loads(content_to_parse)
+                yield (content_type, chunk)
             except json.JSONDecodeError:
                 app.logger.warning(f"无法将SSE数据块解析为JSON: {decoded_line}")
-        elif decoded_line.startswith(("e:", "d:")):
-            # 流结束标记
-            app.logger.info(f"VS AI SSE stream finished.")
-            # 结束生成器
-            return
 
 def _handle_stream_response(response_from_vs_ai, model_name, openai_msg_id):
     """
-    使用 _parse_vs_ai_stream 生成器处理流式响应，并将其转换为OpenAI格式的SSE事件流。
-    :param response_from_vs_ai: VS AI的响应对象。
-    :param model_name: 模型名称。
-    :param openai_msg_id: OpenAI格式的消息ID。
+    使用 _parse_vs_ai_stream 生成器处理流式响应。
+    它会根据内容类型（'content' 或 'reasoning'）实时生成并流式传输相应的SSE事件。
     :return: 一个生成器，逐块产生符合OpenAI格式的SSE事件。
     """
-    # 迭代解析器生成的每个内容块
-    for content_chunk in _parse_vs_ai_stream(response_from_vs_ai):
-        yield generate_stream_response(content_chunk, model_name, openai_msg_id)
+    # 迭代解析器生成的每个 (type, chunk) 元组
+    for content_type, chunk in _parse_vs_ai_stream(response_from_vs_ai):
+        if content_type == "content":
+            yield generate_stream_response(chunk, model_name, openai_msg_id)
+        elif content_type == "reasoning":
+            # 实时流式传输“思考”内容
+            yield generate_stream_reasoning_response(chunk, model_name, openai_msg_id)
     
     # 在流结束后，发送最后的完成事件
     app.logger.info(f"Text Gen SSE stream finished for {openai_msg_id}")
@@ -585,12 +624,34 @@ def _handle_stream_response(response_from_vs_ai, model_name, openai_msg_id):
 
 def _handle_non_stream_response(response_from_vs_ai):
     """
-    使用 _parse_vs_ai_stream 生成器处理流式响应，并将其高效地聚合成单个字符串。
-    :param response_from_vs_ai: VS AI的响应对象。
-    :return: 完整的AI回复字符串。
+    使用 _parse_vs_ai_stream 生成器处理响应，并将其内容和思考部分分别聚合。
+    :return: 一个元组 (full_content_string, full_reasoning_string)。
     """
-    # 使用 "".join() 和生成器来高效地聚合所有内容块
-    return "".join(_parse_vs_ai_stream(response_from_vs_ai))
+    content_parts = []
+    reasoning_parts = []
+    for content_type, chunk in _parse_vs_ai_stream(response_from_vs_ai):
+        if content_type == "content":
+            content_parts.append(chunk)
+        elif content_type == "reasoning":
+            reasoning_parts.append(chunk)
+            
+    return "".join(content_parts), "".join(reasoning_parts)
+
+def _stream_and_cleanup_session(response_from_vs_ai, model_name, openai_msg_id, chat_id_to_delete):
+    """
+    一个包装生成器，它处理向客户端的流式响应，并确保在流完成后删除临时会话。
+    :param response_from_vs_ai: VS AI的响应对象。
+    :param model_name: 模型名称。
+    :param openai_msg_id: OpenAI格式的消息ID。
+    :param chat_id_to_delete: 完成后要删除的VS Chat ID。
+    """
+    try:
+        # 从实际的响应处理程序中 yield 所有数据块
+        yield from _handle_stream_response(response_from_vs_ai, model_name, openai_msg_id)
+    finally:
+        # 此代码在生成器被客户端完全消耗后运行
+        app.logger.info(f"流式传输完成。正在为 {openai_msg_id} 删除临时会话 {chat_id_to_delete}。")
+        delete_chat_session(chat_id_to_delete)
 
 
 @app.route('/v1/chat/new', methods=['GET'])

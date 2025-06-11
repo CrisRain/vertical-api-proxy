@@ -538,45 +538,59 @@ def chat_completions():
         # 确保无论成功失败，都尝试删除此次请求创建的临时会话
         if temp_vs_chat_id: delete_chat_session(temp_vs_chat_id)
 
+def _parse_vs_ai_stream(response_from_vs_ai):
+    """
+    一个生成器，用于解析来自 Vertical Studio AI 的服务器发送事件(SSE)流。
+    该函数迭代响应行，解码它们，并从以 "0:" 开头的行中提取内容块。
+    它会 yield 每个内容块，直到遇到流结束标记 ("e:" 或 "d:")。
+
+    :param response_from_vs_ai: 来自 requests 库的响应对象，其内容是SSE流。
+    :return: 一个生成器，逐个 yield 内容字符串块。
+    """
+    for line in response_from_vs_ai.iter_lines():
+        if not line:
+            continue
+        decoded_line = line.decode('utf-8')
+        # 调试日志记录原始SSE行
+        app.logger.debug(f"VS AI Raw SSE: {decoded_line}")
+        if decoded_line.startswith("0:"):
+            try:
+                # 提取并解码JSON编码的内容块
+                content_chunk = json.loads(decoded_line[2:])
+                yield content_chunk
+            except json.JSONDecodeError:
+                app.logger.warning(f"无法将SSE数据块解析为JSON: {decoded_line}")
+        elif decoded_line.startswith(("e:", "d:")):
+            # 流结束标记
+            app.logger.info(f"VS AI SSE stream finished.")
+            # 结束生成器
+            return
+
 def _handle_stream_response(response_from_vs_ai, model_name, openai_msg_id):
     """
-    处理来自VS AI的流式响应，并将其转换为OpenAI格式的SSE事件流。
+    使用 _parse_vs_ai_stream 生成器处理流式响应，并将其转换为OpenAI格式的SSE事件流。
     :param response_from_vs_ai: VS AI的响应对象。
     :param model_name: 模型名称。
     :param openai_msg_id: OpenAI格式的消息ID。
-    :return: 一个生成器，逐块产生SSE事件。
+    :return: 一个生成器，逐块产生符合OpenAI格式的SSE事件。
     """
-    for line in response_from_vs_ai.iter_lines():
-        if line:
-            decoded_line = line.decode('utf-8')
-            app.logger.debug(f"Text Gen SSE: {decoded_line}")
-            if decoded_line.startswith("0:"): # "0:" 开头的行是内容块
-                try:
-                    content_chunk = json.loads(decoded_line[2:])
-                    yield generate_stream_response(content_chunk, model_name, openai_msg_id)
-                except json.JSONDecodeError:
-                    app.logger.warning(f"无法将SSE数据块解析为JSON: {decoded_line}")
-            elif decoded_line.startswith(("e:", "d:")): # "e:" 或 "d:" 表示流结束
-                app.logger.info(f"Text Gen SSE stream finished for {openai_msg_id}")
-                yield generate_stream_done(model_name, openai_msg_id); yield "data: [DONE]\n\n"; break
+    # 迭代解析器生成的每个内容块
+    for content_chunk in _parse_vs_ai_stream(response_from_vs_ai):
+        yield generate_stream_response(content_chunk, model_name, openai_msg_id)
+    
+    # 在流结束后，发送最后的完成事件
+    app.logger.info(f"Text Gen SSE stream finished for {openai_msg_id}")
+    yield generate_stream_done(model_name, openai_msg_id)
+    yield "data: [DONE]\n\n"
 
 def _handle_non_stream_response(response_from_vs_ai):
     """
-    处理来自VS AI的流式响应，但将其聚合为单个完整的字符串。
+    使用 _parse_vs_ai_stream 生成器处理流式响应，并将其高效地聚合成单个字符串。
     :param response_from_vs_ai: VS AI的响应对象。
     :return: 完整的AI回复字符串。
     """
-    ai_reply_full = ""
-    for line in response_from_vs_ai.iter_lines():
-        if line:
-            decoded_line = line.decode('utf-8')
-            if decoded_line.startswith("0:"):
-                try:
-                    ai_reply_full += json.loads(decoded_line[2:])
-                except json.JSONDecodeError:
-                    app.logger.warning(f"无法将聚合的SSE数据块解析为JSON: {decoded_line}")
-            elif decoded_line.startswith(("e:", "d:")): break
-    return ai_reply_full
+    # 使用 "".join() 和生成器来高效地聚合所有内容块
+    return "".join(_parse_vs_ai_stream(response_from_vs_ai))
 
 
 @app.route('/v1/chat/new', methods=['GET'])

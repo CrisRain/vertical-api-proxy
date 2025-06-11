@@ -491,25 +491,43 @@ def build_prompt_with_history_and_instructions(messages_array):
     app.logger.debug(f"--- 构建的 VS AI 文本提示 ---\n{final_prompt[:500]}...\n--- 提示结束 ---")
     return system_prompt_content,final_prompt
 
+def create_openai_error_response(message, error_type="invalid_request_error", status_code=500):
+    """
+    创建一个符合OpenAI API规范的错误响应。
+    """
+    error_payload = {
+        "error": {
+            "message": message,
+            "type": error_type,
+            "param": None,
+            "code": None
+        }
+    }
+    return jsonify(error_payload), status_code
+
 @app.route('/v1/chat/completions', methods=['POST'])
 def chat_completions():
     """
     处理 OpenAI 兼容的聊天补全请求的主路由。
     """
     data = request.get_json()
+    if not data:
+        return create_openai_error_response("Request body is not valid JSON.", status_code=400)
     client_messages = data.get("messages", [])
     model_requested = data.get("model", list(MODEL_MAPPING.keys())[0])
-    stream = data.get("stream", True)
+    stream = data.get("stream", False)
     temp_vs_chat_id = None
     # 引入一个标志来控制清理逻辑的执行
     cleanup_in_finally = True
 
     try:
-        if not client_messages: return jsonify({"error": "未提供消息"}), 400
+        if not client_messages:
+            return create_openai_error_response("`messages` is a required property.", status_code=400)
         system_prompt_content, final_prompt_for_vs_ai = build_prompt_with_history_and_instructions(client_messages)
 
         temp_vs_chat_id = create_new_chat_session(corner_type=TEXT_CORNER_TYPE)
-        if not temp_vs_chat_id: return jsonify({"error": "创建文本聊天会话失败"}), 500
+        if not temp_vs_chat_id:
+            return create_openai_error_response("Failed to create a new chat session with the upstream service.", error_type="api_error", status_code=502)
 
         openai_msg_id = f"chatcmpl-{uuid.uuid4().hex}"
         vs_msg_id = str(uuid.uuid4()).replace("-", "")[:16]
@@ -536,7 +554,8 @@ def chat_completions():
         if response_from_vs_ai is None or response_from_vs_ai.status_code != 200:
             err_text = response_from_vs_ai.text[:200] if response_from_vs_ai and response_from_vs_ai.content else "No response object or content"
             err_status = response_from_vs_ai.status_code if response_from_vs_ai else "N/A"
-            return jsonify({"error": f"VS AI API 文本聊天请求失败，状态: {err_status}, 响应预览: {err_text}"}), 500
+            error_message = f"Upstream API request failed. Status: {err_status}, Response preview: {err_text}"
+            return create_openai_error_response(error_message, error_type="api_error", status_code=502)
 
         if stream:
             # 对于流式响应，将清理责任转移给包装生成器
@@ -545,11 +564,13 @@ def chat_completions():
         else:
             # 对于非流式响应，在此处完成所有工作，然后由finally块进行清理
             ai_reply_full, reasoning_content = _handle_non_stream_response(response_from_vs_ai)
-            # 构建标准的message对象
-            message_obj = {"role": "assistant", "content": ai_reply_full}
-            # 如果存在思考内容，则将其添加到message对象中
+            # 为了遵循OpenAI格式，我们将任何“思考”内容与最终回复合并到单个content字段中
+            final_content = ai_reply_full
             if reasoning_content:
-                message_obj["reasoning_content"] = reasoning_content
+                # 合并内容，同时保持可读性
+                final_content = f"{reasoning_content}\n\n{ai_reply_full}"
+
+            message_obj = {"role": "assistant", "content": final_content}
                 
             openai_response = {
                 "id": openai_msg_id,
@@ -561,8 +582,8 @@ def chat_completions():
             }
             return jsonify(openai_response)
     except Exception as e:
-        app.logger.error(f"处理 /v1/chat/completions 时发生异常: {e}", exc_info=True)
-        return jsonify({"error": f"内部服务器错误: {str(e)}"}), 500
+        app.logger.error(f"An unexpected error occurred in /v1/chat/completions: {e}", exc_info=True)
+        return create_openai_error_response(f"An internal server error occurred: {str(e)}", error_type="api_error", status_code=500)
     finally:
         # 仅当清理责任未被转移时，才在此处执行清理
         if temp_vs_chat_id and cleanup_in_finally:

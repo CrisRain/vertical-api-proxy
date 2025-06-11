@@ -564,13 +564,9 @@ def chat_completions():
         else:
             # 对于非流式响应，在此处完成所有工作，然后由finally块进行清理
             ai_reply_full, reasoning_content = _handle_non_stream_response(response_from_vs_ai)
-            # 为了遵循OpenAI格式，我们将任何“思考”内容与最终回复合并到单个content字段中
-            final_content = ai_reply_full
-            if reasoning_content:
-                # 合并内容，同时保持可读性
-                final_content = f"{reasoning_content}\n\n{ai_reply_full}"
-
-            message_obj = {"role": "assistant", "content": final_content}
+            # 根据用户反馈，非流式响应不应包含思考内容。
+            # 因此，我们只使用ai_reply_full作为最终内容。
+            message_obj = {"role": "assistant", "content": ai_reply_full}
                 
             openai_response = {
                 "id": openai_msg_id,

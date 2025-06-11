@@ -54,7 +54,7 @@
 
 克隆本仓库到您的本地：
 ```bash
-git clone https://github.com/your-username/vertical-2-api.git
+git clone https://github.com/CrisRain/vertical-api-proxy.git
 cd vertical-2-api
 ```
 

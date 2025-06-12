@@ -37,6 +37,7 @@ STREAM_BASE_URL = "https://app.verticalstudio.ai/stream"
 STREAM_CORNERS_BASE_URL = "https://app.verticalstudio.ai/stream/corners"
 STREAM_DATA_URL = "https://app.verticalstudio.ai/stream.data"
 TEXT_CORNER_TYPE = "text"
+MAX_HISTORY_TOKENS = 100000
 
 # --- 基础请求头 ---
 BASE_HEADERS = {
@@ -403,8 +404,9 @@ def build_prompt_with_history_and_instructions(messages_array):
         return "", ""
 
     system_prompts = []
-    history_parts = []
-    
+    history_messages = []
+
+    # 1. Separate system prompts from history messages
     for message in messages_array:
         role = message.get("role", "user").lower()
         content = message.get("content", "")
@@ -419,14 +421,40 @@ def build_prompt_with_history_and_instructions(messages_array):
 
         if role == "system":
             system_prompts.append(content)
-        elif role in ["user", "human"]:
-            history_parts.append(f"\n\nHuman: {content}")
-        elif role in ["assistant", "ai"]:
-            history_parts.append(f"\n\nAssistant: {content}")
+        else:
+            history_messages.append({"role": role, "content": content})
 
     system_prompt_content = "\n\n".join(system_prompts)
-    formatted_history = "".join(history_parts).strip()
+
+    # 2. Build history, truncating from the oldest messages if token limit is exceeded.
+    # We iterate from newest to oldest to decide which messages to keep.
+    final_history_parts = []
+    current_token_count = 0
     
+    for message in reversed(history_messages):
+        role = message["role"]
+        content = message["content"]
+        
+        part_str = ""
+        if role in ["user", "human"]:
+            part_str = f"\n\nHuman: {content}"
+        elif role in ["assistant", "ai"]:
+            part_str = f"\n\nAssistant: {content}"
+        
+        # Using len() as a proxy for token count
+        part_token_count = len(part_str)
+
+        if current_token_count + part_token_count > MAX_HISTORY_TOKENS:
+            app.logger.info(f"History token limit ({MAX_HISTORY_TOKENS}) reached. Older messages will be discarded.")
+            break  # Stop adding older messages
+        
+        final_history_parts.append(part_str)
+        current_token_count += part_token_count
+
+    # The parts are in reverse order, so reverse them back to chronological order
+    formatted_history = "".join(reversed(final_history_parts)).strip()
+    
+    # 3. Construct the final prompt for the API
     final_prompt_elements = []
     if formatted_history:
         final_prompt_elements.append(formatted_history)

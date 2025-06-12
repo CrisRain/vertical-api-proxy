@@ -9,12 +9,12 @@ COPY requirements.txt requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
 # 复制应用代码到工作目录
-COPY app.py .
-# 注意：config.yml 将通过环境变量处理，所以不直接复制到镜像中
+COPY . .
 
-# Hugging Face Spaces 通常期望应用监听 7860 端口
-ENV PORT=7860
-EXPOSE 7860
+# 暴露应用端口
+# Hugging Face Spaces 通常期望应用监听 7860 端口，但我们将使其可配置
+ENV PORT=${PORT:-7860}
+EXPOSE $PORT
 
-# 运行应用的命令
+# 使用 Hypercorn 运行应用
 CMD ["python", "app.py"]

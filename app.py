@@ -1,5 +1,5 @@
 import dotenv
-from flask import Flask, request, jsonify, Response
+from quart import Quart, request, jsonify, Response
 import httpx
 import json
 import uuid
@@ -14,15 +14,17 @@ import asyncio
 import time
 import logging
 import base64
-import queue
-import threading
+import aiofiles
+import typing
+from hypercorn.asyncio import serve
+from hypercorn.config import Config
 
-app = Flask(__name__)
+app = Quart(__name__)
 # --- Logging Configuration ---
-# Configure logger to output to stdout, ensuring visibility when running with Waitress
 handler = logging.StreamHandler(sys.stdout)
 handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-app.logger.handlers.clear() # Clear existing handlers
+handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+app.logger.handlers.clear()
 app.logger.addHandler(handler)
 app.logger.setLevel(logging.INFO)
 
@@ -47,6 +49,8 @@ BASE_HEADERS = {
     "Sec-Fetch-Mode": "cors", "Sec-Fetch-Site": "same-origin",
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36"
 }
+# --- Timeout Configuration ---
+DEFAULT_REQUEST_TIMEOUT = httpx.Timeout(3600.0, connect=3600.0, read=3600.0, write=3600.0)
 
 # --- 文本模型映射 ---
 MODEL_MAPPING = {
@@ -66,8 +70,6 @@ MODEL_MAPPING = {
 }
 
 # --- 全局状态变量 ---
-# 全局的 httpx.AsyncClient 在与Flask/Waitress集成时会导致事件循环问题，因此被移除。
-# Cookie 将作为独立对象进行管理。
 GLOBAL_COOKIES = httpx.Cookies()
 COOKIE_LAST_REFRESH = None
 COOKIE_REFRESH_INTERVAL = 12 * 60 * 60  # 12 hours
@@ -76,7 +78,11 @@ RETRY_DELAY = 2  # seconds
 COOKIE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.json")
 SESSIONS = {}
 CHAT_IDS = {}
-initialization_complete = asyncio.Event()
+initialization_complete = asyncio.Event() # Signals that the server is ready to accept requests
+login_pending = asyncio.Event() # Signals if a background login/setup task is active. Set = idle/complete, Clear = active.
+login_pending.set() # Initialize as idle
+cookies_are_genuinely_valid = False # Tracks if cookies are verified and usable
+HTTP_CLIENT: typing.Optional[httpx.AsyncClient] = None # Global HTTP client
 
 def load_credentials():
     dotenv.load_dotenv(".env")
@@ -92,8 +98,9 @@ async def load_cookies_from_file():
     global COOKIE_LAST_REFRESH, GLOBAL_COOKIES
     if os.path.exists(COOKIE_FILE):
         try:
-            with open(COOKIE_FILE, 'r') as f:
-                data = json.load(f)
+            async with aiofiles.open(COOKIE_FILE, 'r') as f:
+                content = await f.read()
+                data = json.loads(content)
                 cookies_dict = data.get("cookies")
                 last_refresh_str = data.get("last_refresh")
                 if cookies_dict and last_refresh_str:
@@ -109,37 +116,39 @@ async def save_cookies_to_file():
     global GLOBAL_COOKIES, COOKIE_LAST_REFRESH
     if GLOBAL_COOKIES and COOKIE_LAST_REFRESH:
         try:
-            with open(COOKIE_FILE, 'w') as f:
-                json.dump({
+            async with aiofiles.open(COOKIE_FILE, 'w') as f:
+                await f.write(json.dumps({
                     "cookies": dict(GLOBAL_COOKIES),
                     "last_refresh": COOKIE_LAST_REFRESH.isoformat()
-                }, f)
+                }))
             app.logger.info(f"Cookie已成功保存到 {COOKIE_FILE}")
         except IOError as e:
             app.logger.error(f"保存Cookie到文件失败: {e}")
 
 async def login_and_get_cookies(email, password):
-    global COOKIE_LAST_REFRESH, GLOBAL_COOKIES
+    global COOKIE_LAST_REFRESH, GLOBAL_COOKIES, HTTP_CLIENT
     app.logger.info("正在尝试登录...")
     try:
-        async with httpx.AsyncClient(headers=BASE_HEADERS, timeout=30, follow_redirects=True) as client:
-            await client.get(LOGIN_URL)
+        # Use a temporary client for the login process to avoid altering global client's state prematurely
+        async with httpx.AsyncClient(headers=BASE_HEADERS, timeout=30, follow_redirects=True) as login_client:
+            await login_client.get(LOGIN_URL)
             email_encoded = urlencode({"email": email})
             login_password_url = f"{LOGIN_PASSWORD_DATA_URL}?{email_encoded}"
-            await client.get(login_password_url)
+            await login_client.get(login_password_url)
             
             form_data = {"email": email, "password": password}
-            response = await client.post(login_password_url, data=form_data, headers={"Content-Type": "application/x-www-form-urlencoded;charset=UTF-8"})
+            response = await login_client.post(login_password_url, data=form_data, headers={"Content-Type": "application/x-www-form-urlencoded;charset=UTF-8"})
             
-            if response.status_code in [200, 202, 302] and any('auth-token' in name for name in client.cookies):
-                GLOBAL_COOKIES = client.cookies
+            if response.status_code in [200, 202, 302] and any('auth-token' in name for name in login_client.cookies):
+                GLOBAL_COOKIES = login_client.cookies
                 COOKIE_LAST_REFRESH = datetime.now(timezone.utc)
-                app.logger.info(f"登录成功，已更新Cookies!")
+                if HTTP_CLIENT:
+                    HTTP_CLIENT.cookies = GLOBAL_COOKIES # Update global client's cookies
+                app.logger.info(f"登录成功，已更新Cookies (全局和HTTP_CLIENT)!")
                 await save_cookies_to_file()
                 return True
             else:
-                # 恢复对auth-token的检查，因为现在是在一个干净的会话中
-                app.logger.error(f"登录失败: 状态码 {response.status_code}, 响应: {response.text[:200]}... Cookies: {client.cookies}")
+                app.logger.error(f"登录失败: 状态码 {response.status_code}, 响应: {response.text[:200]}... Cookies: {login_client.cookies}")
                 return False
     except httpx.RequestError as e:
         app.logger.error(f"登录过程中发生网络错误: {e}")
@@ -164,25 +173,44 @@ async def schedule_cookie_refresh(email, password):
     asyncio.create_task(refresh_loop())
     app.logger.info("已启动Cookie定时刷新任务。")
 
-async def create_new_chat_session(client, corner_type=TEXT_CORNER_TYPE):
+async def create_new_chat_session(corner_type=TEXT_CORNER_TYPE): # Removed client argument
+    if not HTTP_CLIENT:
+        app.logger.error("创建新聊天会话失败：全局 HTTP_CLIENT 未初始化。")
+        raise Exception("内部服务器错误: HTTP客户端未就绪")
+
     app.logger.info(f"尝试为 '{corner_type}' 类型创建新的VS会话...")
     try:
-        await client.get(STREAM_BASE_URL)
+        # Step 1: Initial GET to stream base URL (seems like a pre-step, session warmer?)
+        # Using make_request_with_retry to handle potential issues like client not ready or network errors
+        response_stream_base = await make_request_with_retry("GET", STREAM_BASE_URL)
+        if not response_stream_base:
+            app.logger.error(f"创建VS Chat ID的第一步GET {STREAM_BASE_URL} 失败。")
+            return None
         
+        # Step 2: POST dummy prompt
         dummy_prompt_val = str(uuid.uuid4())
         post_form_data = {"prompt": dummy_prompt_val, "intent": "execute-prompt"}
-        await client.post(f"{STREAM_DATA_URL}?searchType=studio", data=post_form_data, headers={"Content-Type": "application/x-www-form-urlencoded;charset=UTF-8"})
-        
+        response_post_dummy = await make_request_with_retry("POST", f"{STREAM_DATA_URL}?searchType=studio", data=post_form_data, headers={"Content-Type": "application/x-www-form-urlencoded;charset=UTF-8"})
+        if not response_post_dummy:
+             app.logger.error(f"创建VS Chat ID的第二步POST {STREAM_DATA_URL} 失败。")
+             return None
+
+        # Step 3: GET specific corner data URL, expecting a redirect or chat ID in response
         specific_corner_data_url = f"{STREAM_CORNERS_BASE_URL}/{corner_type}.data?prompt={dummy_prompt_val}"
-        response = await client.get(specific_corner_data_url, follow_redirects=False)
+        
+        # This specific GET in original code used follow_redirects=False and parsed Location header.
+        # We need a client instance that has follow_redirects=False for this step.
+        # It's safer to create a temporary client for this specific request if global HTTP_CLIENT follows redirects.
+        async with httpx.AsyncClient(headers=BASE_HEADERS, cookies=GLOBAL_COOKIES, timeout=30, follow_redirects=False) as temp_redirect_client:
+            response_get_corner = await temp_redirect_client.get(specific_corner_data_url)
 
         new_chat_id = None
-        if response.status_code in [202, 301, 302, 303, 307, 308] and 'Location' in response.headers:
-            location_url = response.headers['Location']
+        if response_get_corner.status_code in [202, 301, 302, 303, 307, 308] and 'Location' in response_get_corner.headers:
+            location_url = response_get_corner.headers['Location']
             match = re.search(rf'/stream/corners/{corner_type}/([\w-]+)', location_url)
             if match: new_chat_id = match.group(1)
-        elif response.status_code == 200:
-            content_to_search = response.text
+        elif response_get_corner.status_code == 200: # Sometimes the ID is in the body on 200 OK
+            content_to_search = response_get_corner.text
             match = re.search(rf'/stream/corners/{corner_type}/([\w-]+)', content_to_search)
             if match: new_chat_id = match.group(1)
 
@@ -190,42 +218,77 @@ async def create_new_chat_session(client, corner_type=TEXT_CORNER_TYPE):
             app.logger.info(f"成功提取到Chat ID: {new_chat_id}")
             return new_chat_id
         else:
-            app.logger.error(f"未能提取Chat ID。状态: {response.status_code}, 头: {response.headers}")
+            # Log more info for debugging if chat_id extraction fails
+            app.logger.error(f"未能提取Chat ID。URL: {specific_corner_data_url}, 状态: {response_get_corner.status_code}, 头: {response_get_corner.headers}, 响应体(部分): {response_get_corner.text[:200]}")
             return None
-    except httpx.RequestError as e:
-        app.logger.error(f"创建VS Chat ID时发生网络错误: {e}")
+    except httpx.RequestError as e: # Catch network errors from any step
+        app.logger.error(f"创建VS Chat ID时发生网络错误: {e}。这通常表示DNS解析失败或网络连接问题。请检查您的网络设置和到 'app.verticalstudio.ai' 的连接。")
+        raise e # Re-raise to be caught by the calling handler (e.g., handle_chat_request)
+
+async def make_request_with_retry(method, url, **kwargs): # Removed client argument
+    if not HTTP_CLIENT:
+        app.logger.error("全局 HTTP_CLIENT 未初始化! 无法执行请求。")
+        # This is a critical internal error.
+        # Depending on context, might raise an exception or return a specific error indicator.
         return None
 
-async def make_request_with_retry(client, method, url, **kwargs):
-    # This function now requires the client to be passed in.
+    # kwargs can include 'json', 'data', 'headers'.
+    # HTTP_CLIENT.cookies is assumed to be managed and up-to-date via login_and_get_cookies.
+    
     for attempt in range(MAX_RETRIES):
         try:
-            # The client is passed in, so we use it directly.
-            response = await client.request(method, url, **kwargs)
-            if response.status_code in [401, 403]:
-                app.logger.warning(f"认证失败 (状态码 {response.status_code})，尝试重新登录...")
-                email, password = load_credentials()
-                if email and password and await login_and_get_cookies(email, password):
-                    app.logger.info("重新登录成功，但需要调用者使用新Cookie重试。")
-                    # Signal to the caller that a retry should happen with fresh cookies.
-                    return "RETRY_WITH_NEW_CLIENT"
+            response = await HTTP_CLIENT.request(method, url, **kwargs)
+
+            if response.status_code in [401, 403]: # Unauthorized or Forbidden
+                app.logger.warning(f"请求 {method} {url} 认证失败 (状态码 {response.status_code})。尝试重新登录...")
+                email_creds, password_creds = load_credentials() # Ensure var names don't clash if this is nested
+                if email_creds and password_creds:
+                    if await login_and_get_cookies(email_creds, password_creds): # This updates HTTP_CLIENT.cookies
+                        app.logger.info("重新登录成功。将重试之前的请求。")
+                        # Cookies in HTTP_CLIENT are now fresh. Continue to the next attempt to retry the request.
+                        if attempt < MAX_RETRIES - 1: # Only sleep and continue if there are retries left
+                             await asyncio.sleep(RETRY_DELAY) # Wait a bit before retrying
+                             continue # Retry the request in the next iteration of the loop
+                        else:
+                             app.logger.error(f"重新登录成功，但已达到对 {method} {url} 的最大重试次数。")
+                             return response # Return the 401/403 response after last attempt
+                    else:
+                        app.logger.error(f"重新登录失败。无法重试请求 {method} {url}。")
+                        return response # Return the 401/403 response
                 else:
-                    app.logger.error("重新登录失败。")
-                    return None
-            response.raise_for_status()
+                    app.logger.error(f"无法加载凭据进行重新登录以重试 {method} {url}。")
+                    return response # Return the 401/403 response
+            
+            response.raise_for_status() # Raise an HTTPStatusError for other 4xx/5xx responses
             return response
-        except httpx.HTTPStatusError as e:
-            app.logger.warning(f"请求失败: {e.response.status_code}, 响应: {e.response.text[:200]}")
-        except httpx.RequestError as e:
-            app.logger.error(f"请求发生错误: {e}")
         
+        except httpx.HTTPStatusError as e: # Errors raised by response.raise_for_status() or non-401/403 status codes
+            app.logger.warning(f"请求 {method} {url} 失败 (尝试 {attempt + 1}/{MAX_RETRIES}): 状态码 {e.response.status_code}, 响应(部分): {e.response.text[:200]}")
+            # Retry only for specific server-side errors or if configured
+            if e.response.status_code in [500, 502, 503, 504]: # Common retryable server errors
+                if attempt < MAX_RETRIES - 1:
+                    await asyncio.sleep(RETRY_DELAY * (attempt + 1)) # Exponential backoff might be better
+                    continue
+            return e.response # Return the error response if not retrying or after last retry
+            
+        except httpx.RequestError as e: # Network-level errors (ConnectTimeout, ReadTimeout, DNS error etc.)
+            app.logger.error(f"请求 {method} {url} (尝试 {attempt + 1}/{MAX_RETRIES}) 发生网络错误: {type(e).__name__} - {e}")
+        
+        # Common delay for retries due to RequestError or if loop continues after HTTPStatusError retry
         if attempt < MAX_RETRIES - 1:
             await asyncio.sleep(RETRY_DELAY * (attempt + 1))
-    app.logger.error(f"所有 {MAX_RETRIES} 次重试均失败: {url}")
-    return None
+            
+    app.logger.error(f"对 {method} {url} 的所有 {MAX_RETRIES} 次重试均失败。")
+    return None # Indicate all retries failed
 
-async def delete_chat_session(client, chat_id_to_delete):
-    if not chat_id_to_delete: return
+async def delete_chat_session(chat_id_to_delete): # Removed client argument
+    if not HTTP_CLIENT:
+        app.logger.error("删除聊天会话失败：全局 HTTP_CLIENT 未初始化。")
+        return
+    if not chat_id_to_delete:
+        app.logger.debug("delete_chat_session called with no chat_id_to_delete.")
+        return
+
     app.logger.info(f"准备删除临时VS Chat会话: {chat_id_to_delete}")
     try:
         headers = {
@@ -233,48 +296,81 @@ async def delete_chat_session(client, chat_id_to_delete):
             "Referer": f"{STREAM_CORNERS_BASE_URL}/{TEXT_CORNER_TYPE}/{chat_id_to_delete}"
         }
         payload = {"chat": chat_id_to_delete}
-        response = await make_request_with_retry(client, "POST", ARCHIVE_CHAT_URL, headers=headers, data=payload)
-        if response and response != "RETRY_WITH_NEW_CLIENT" and response.status_code == 200:
+        # Use make_request_with_retry for deleting the session as well
+        response = await make_request_with_retry("POST", ARCHIVE_CHAT_URL, headers=headers, data=payload)
+        
+        if response and response.status_code == 200:
             app.logger.info(f"临时VS Chat会话 {chat_id_to_delete} 删除成功!")
+        elif response: # Response received, but not 200 OK
+            app.logger.warning(f"删除临时VS Chat会话 {chat_id_to_delete} 失败，状态码: {response.status_code}, 响应(部分): {response.text[:200]}")
+        else: # No response from make_request_with_retry, meaning all retries failed
+             app.logger.warning(f"删除临时VS Chat会话 {chat_id_to_delete} 失败，所有重试均未成功或未收到响应。")
+    except Exception as e: # Catch any other unexpected errors during the delete process
+        app.logger.error(f"删除临时VS Chat会话 {chat_id_to_delete} 时发生意外错误: {type(e).__name__} - {e}", exc_info=True)
+
+async def background_login_and_setup(email, password):
+    global cookies_are_genuinely_valid, login_pending
+    
+    login_pending.clear() # Indicate background login is in progress
+    app.logger.info("后台登录和设置任务已启动。")
+    
+    try:
+        if await login_and_get_cookies(email, password): # This updates GLOBAL_COOKIES and HTTP_CLIENT.cookies
+            cookies_are_genuinely_valid = True
+            app.logger.info("后台登录成功。Cookies 已验证并更新。")
+            # Schedule regular refreshes only after a successful login
+            # Pass email and password to the task directly.
+            asyncio.create_task(schedule_cookie_refresh(email, password))
         else:
-            status_text = '无响应'
-            if isinstance(response, httpx.Response):
-                status_text = response.status_code
-            elif response == "RETRY_WITH_NEW_CLIENT":
-                status_text = "需要使用新客户端重试"
-            app.logger.warning(f"删除临时VS Chat会话 {chat_id_to_delete} 失败，状态码: {status_text}")
+            cookies_are_genuinely_valid = False
+            app.logger.error("后台登录失败。服务可能无法正常处理依赖认证的请求。将不会启动定时刷新。")
+            # Consider adding more robust retry logic for background_login_and_setup itself if initial fails,
+            # or a periodic check to re-attempt background_login_and_setup.
     except Exception as e:
-        app.logger.error(f"删除临时VS Chat会话时发生错误: {e}")
+        cookies_are_genuinely_valid = False
+        app.logger.error(f"后台登录任务中发生意外错误: {type(e).__name__} - {e}", exc_info=True)
+    finally:
+        login_pending.set() # Signal completion of this login attempt (success or fail)
+        app.logger.info(f"后台登录和设置任务已结束。最终认证状态: {cookies_are_genuinely_valid}")
 
 async def initialize():
+    global cookies_are_genuinely_valid, COOKIE_LAST_REFRESH, GLOBAL_COOKIES, HTTP_CLIENT
+
     email, password = load_credentials()
     if not (email and password):
-        app.logger.critical("未能加载凭据，程序退出。")
-        sys.exit(1)
+        app.logger.critical("未能加载凭据，无法继续初始化。程序退出。")
+        # Instead of sys.exit, let Quart handle startup failure if possible, or raise a specific exception.
+        raise RuntimeError("VS_EMAIL or VS_PASSWORD not set in environment.")
 
-    if not await load_cookies_from_file() or check_cookie_refresh():
-        app.logger.info("Cookie无效或过期，尝试登录...")
-        if not await login_and_get_cookies(email, password):
-            app.logger.critical("登录失败，请检查凭据和网络。程序退出。")
-            sys.exit(1)
+    # Try to load cookies from file first. This updates GLOBAL_COOKIES and COOKIE_LAST_REFRESH.
+    if await load_cookies_from_file():
+        if not check_cookie_refresh(): # Check if loaded cookies are still fresh and valid
+            cookies_are_genuinely_valid = True
+            if HTTP_CLIENT: # Ensure global client uses these loaded cookies
+                 HTTP_CLIENT.cookies = GLOBAL_COOKIES # This should be the same object instance if load_cookies_from_file modifies GLOBAL_COOKIES in place
+            app.logger.info("成功从文件加载有效且未过期的Cookie。将安排后台刷新。")
+            # Schedule refresh task even if current cookies are valid, for future expirations.
+            asyncio.create_task(schedule_cookie_refresh(email, password))
+        else:
+            # Cookies loaded from file but are expired or failed staleness check
+            app.logger.info("从文件加载的Cookie已过期或无效。将在后台尝试刷新/登录。")
+            cookies_are_genuinely_valid = False # Mark as invalid until background login succeeds
+            asyncio.create_task(background_login_and_setup(email, password))
     else:
-        app.logger.info("使用已加载的Cookie。")
+        # Failed to load cookies from file (e.g., first run, or file corrupted)
+        app.logger.info("未能从文件加载Cookie。将在后台尝试执行初始登录。")
+        cookies_are_genuinely_valid = False
+        asyncio.create_task(background_login_and_setup(email, password))
 
-    await schedule_cookie_refresh(email, password)
-    app.logger.info("初始化完成。")
-    app.logger.info("✅ 服务已就绪，可以开始接收 API 请求。")
-    initialization_complete.set()
+    app.logger.info("核心初始化逻辑已调度。服务器即将启动。")
+    app.logger.info("注意: 依赖认证的API功能可能需要等待后台登录/Cookie验证完成。")
+    initialization_complete.set() # Unblock server startup quickly
 
 def create_openai_error_response(message, error_type="invalid_request_error", status_code=500):
-    # This function relies on Flask's app context. It cannot be used inside
-    # the stream_async_generator's separate event loop.
-    return jsonify({"error": {"message": message, "type": error_type}}), status_code
+    response_data = {"error": {"message": message, "type": error_type}}
+    return jsonify(response_data), status_code
 
 def create_manual_openai_error_chunk(message, error_type="invalid_request_error"):
-    """
-    Creates an OpenAI-compatible error chunk as a dictionary,
-    without relying on Flask's app/request context.
-    """
     return {
         "error": {
             "message": message,
@@ -284,15 +380,16 @@ def create_manual_openai_error_chunk(message, error_type="invalid_request_error"
         }
     }
 
-# ... [保留 generate_stream_response, generate_stream_done, 等辅助函数] ...
 def generate_stream_response(content_chunk, model, message_id):
     chunk_data = {"id": message_id, "object": "chat.completion.chunk", "created": int(time.time()), "model": model,
                   "choices": [{"delta": {"content": content_chunk}, "index": 0, "finish_reason": None}]}
     return f"data: {json.dumps(chunk_data)}\n\n"
 
-def generate_stream_done(model, message_id):
+def generate_stream_done(model, message_id, usage=None):
     done_data = {"id": message_id, "object": "chat.completion.chunk", "created": int(time.time()), "model": model,
                  "choices": [{"delta": {}, "index": 0, "finish_reason": "stop"}]}
+    if usage:
+        done_data['usage'] = usage
     return f"data: {json.dumps(done_data)}\n\n"
 
 def generate_stream_reasoning_response(reasoning_chunk, model, message_id):
@@ -301,196 +398,267 @@ def generate_stream_reasoning_response(reasoning_chunk, model, message_id):
     return f"data: {json.dumps(chunk_data)}\n\n"
 
 
-
 def build_prompt_with_history_and_instructions(messages_array):
-    if not messages_array: return ""
-    system_prompt_content = ""
-    dialogue_messages = messages_array
-    if messages_array[0].get("role") == "system":
-        system_prompt_content = messages_array[0].get("content", "").strip()
-        dialogue_messages = messages_array[1:]
-    
+    if not messages_array:
+        return "", ""
+
+    system_prompts = []
     history_parts = []
-    for message in dialogue_messages:
+    
+    for message in messages_array:
         role = message.get("role", "user").lower()
-        content = message.get("content", "").strip()
-        if not content: continue
+        content = message.get("content", "")
+        
+        if not isinstance(content, str):
+            app.logger.warning(f"消息内容不是字符串，已跳过: {content}")
+            continue
+        
+        content = content.strip()
+        if not content:
+            continue
+
         if role == "system":
-            system_prompt_content += f"\n\n{content}"
+            system_prompts.append(content)
         elif role in ["user", "human"]:
             history_parts.append(f"\n\nHuman: {content}")
         elif role in ["assistant", "ai"]:
             history_parts.append(f"\n\nAssistant: {content}")
 
-    formatted_history = "\n".join(history_parts).strip()
+    system_prompt_content = "\n\n".join(system_prompts)
+    formatted_history = "".join(history_parts).strip()
     
     final_prompt_elements = []
-    if formatted_history: final_prompt_elements.append(formatted_history)
+    if formatted_history:
+        final_prompt_elements.append(formatted_history)
     final_prompt_elements.append("\n\nAssistant:")
     
-    final_prompt = "\n".join(final_prompt_elements).strip()
+    final_prompt = "".join(final_prompt_elements)
     return system_prompt_content, final_prompt
 
-@app.route('/v1/chat/completions', methods=['POST'])
-async def chat_completions():
-    data = request.get_json()
-    if not data:
-        return create_openai_error_response("请求体不是有效的JSON。", status_code=400)
-
+async def handle_chat_request(data) -> typing.Union[Response, tuple[Response, int]]:
     client_messages = data.get("messages", [])
-    if not client_messages:
-        return create_openai_error_response("`messages`是必需的属性。", status_code=400)
-
     model_requested = data.get("model", list(MODEL_MAPPING.keys())[0])
     stream = data.get("stream", False)
-    
-    # Use a client with a lifecycle tied to the request
-    async with httpx.AsyncClient(headers=BASE_HEADERS, cookies=GLOBAL_COOKIES, timeout=30, follow_redirects=True) as client:
-        temp_vs_chat_id = None
-        try:
-            temp_vs_chat_id = await create_new_chat_session(client)
-            if not temp_vs_chat_id:
-                return create_openai_error_response("无法创建新的聊天会话。", status_code=502)
+    response_to_return = None
 
-            system_prompt, final_prompt = build_prompt_with_history_and_instructions(client_messages)
-            vs_text_model_id = MODEL_MAPPING.get(model_requested, list(MODEL_MAPPING.values())[0])
-            
-            openai_msg_id = f"chatcmpl-{uuid.uuid4().hex}"
-            vs_msg_id = str(uuid.uuid4()).replace("-", "")[:16]
-            created_at = datetime.now(timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+    if not HTTP_CLIENT:
+        app.logger.error("处理聊天请求失败：关键的全局 HTTP_CLIENT 未初始化。")
+        return create_openai_error_response("内部服务器配置错误，HTTP客户端丢失。", status_code=500)
+        
+    temp_vs_chat_id = None
+    try:
+        temp_vs_chat_id = await create_new_chat_session()
+        if not temp_vs_chat_id:
+            raise Exception("无法创建新的聊天会话。请检查上游服务状态或网络连接。")
 
-            payload = {
-                "message": {"id": vs_msg_id, "createdAt": created_at, "role": "user", "content": final_prompt, "parts": [{"type": "text", "text": final_prompt}]},
-                "cornerType": TEXT_CORNER_TYPE, "chatId": temp_vs_chat_id,
-                "settings": {"modelId": vs_text_model_id, "customSystemPrompt": system_prompt}
-            }
-            if "claude" in vs_text_model_id:
-                 payload["settings"]["reasoning"] = "on"
+        system_prompt, final_prompt = build_prompt_with_history_and_instructions(client_messages)
+        vs_text_model_id = MODEL_MAPPING.get(model_requested, list(MODEL_MAPPING.values())[0])
+        
+        openai_msg_id = f"chatcmpl-{uuid.uuid4().hex}"
+        vs_msg_id = str(uuid.uuid4()).replace("-", "")[:16]
+        created_at_iso = datetime.now(timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
 
-            headers = {"Content-Type": "application/json", "Referer": f"{STREAM_CORNERS_BASE_URL}/{TEXT_CORNER_TYPE}/{temp_vs_chat_id}"}
-            
-            if stream:
-                data_queue = queue.Queue()
+        payload = {
+            "message": {"id": vs_msg_id, "createdAt": created_at_iso, "role": "user", "content": final_prompt, "parts": [{"type": "text", "text": final_prompt}]},
+            "cornerType": TEXT_CORNER_TYPE, "chatId": temp_vs_chat_id,
+            "settings": {"modelId": vs_text_model_id, "customSystemPrompt": system_prompt}
+        }
+        if "claude" in vs_text_model_id:
+            payload["settings"]["reasoning"] = "on"
 
-                async def producer():
-                    # This async producer runs the original async generator
-                    # and puts the data into a thread-safe queue.
-                    nonlocal temp_vs_chat_id
-                    client_for_stream = httpx.AsyncClient(headers=BASE_HEADERS, cookies=GLOBAL_COOKIES, timeout=30, follow_redirects=True)
-                    try:
-                        async with client_for_stream.stream("POST", CHAT_API_URL, json=payload, headers=headers, timeout=120) as response:
-                            if response.status_code >= 400:
+        chat_api_headers = {"Content-Type": "application/json", "Referer": f"{STREAM_CORNERS_BASE_URL}/{TEXT_CORNER_TYPE}/{temp_vs_chat_id}"}
+        
+        if stream:
+            queue = asyncio.Queue()
+
+            async def data_reader(target_chat_id, stream_payload_data):
+                try:
+                    async with httpx.AsyncClient(headers=BASE_HEADERS, cookies=GLOBAL_COOKIES, timeout=None, follow_redirects=False) as client:
+                        async with client.stream("POST", CHAT_API_URL, json=stream_payload_data, headers=chat_api_headers) as response:
+                            if response.status_code != 200:
                                 error_body = await response.aread()
-                                error_msg = f"Upstream API error: {response.status_code} - {error_body.decode()}"
-                                app.logger.error(error_msg)
-                                error_chunk = create_manual_openai_error_chunk(error_msg)
-                                data_queue.put(f"data: {json.dumps(error_chunk)}\n\n")
+                                await queue.put(httpx.HTTPStatusError(f"上游API流式响应错误: {response.status_code}", request=response.request, response=response))
                                 return
 
                             async for line in response.aiter_lines():
-                                if line.startswith("0:"):
-                                    chunk = json.loads(line[2:])
-                                    data_queue.put(generate_stream_response(chunk, model_requested, openai_msg_id))
-                                elif line.startswith("g:"):
-                                    chunk = json.loads(line[2:])
-                                    data_queue.put(generate_stream_reasoning_response(chunk, model_requested, openai_msg_id))
-                            
-                            data_queue.put(generate_stream_done(model_requested, openai_msg_id))
-                            data_queue.put("data: [DONE]\n\n")
+                                await queue.put(line)
+                except Exception as e:
+                    await queue.put(e)
+                finally:
+                    await queue.put(None) # Signal completion
 
-                    except Exception as e:
-                        app.logger.error(f"Error during stream proxy: {e}", exc_info=True)
-                        error_chunk = create_manual_openai_error_chunk(f"Internal stream error: {e}")
-                        data_queue.put(f"data: {json.dumps(error_chunk)}\n\n")
-                    
-                    finally:
-                        await client_for_stream.aclose()
-                        if temp_vs_chat_id:
-                            async with httpx.AsyncClient(headers=BASE_HEADERS, cookies=GLOBAL_COOKIES) as cleanup_client:
-                                await delete_chat_session(cleanup_client, temp_vs_chat_id)
-                                temp_vs_chat_id = None
-                        data_queue.put(None)  # Signal that we are done.
+            async def heartbeat_sender():
+                last_activity_time = time.time()
+                while True:
+                    await asyncio.sleep(5)  # 更频繁地检查
+                    current_time = time.time()
+                    # 无论队列状态如何，每30秒发送一次心跳
+                    if current_time - last_activity_time >= 5:
+                        await queue.put(":heartbeat\n\n")
+                        last_activity_time = current_time
 
-                def consumer():
-                    # This sync consumer pulls data from the queue and yields it.
-                    # This is what Flask's Response object will interact with.
-                    while True:
-                        item = data_queue.get()
-                        if item is None:
-                            break
-                        yield item
-
-                # Run the async producer in a separate daemon thread.
-                thread = threading.Thread(target=lambda: asyncio.run(producer()), daemon=True)
-                thread.start()
-
-                return Response(consumer(), mimetype="text/event-stream")
-
-            # Handle non-streaming case
-            else:
-                response = await make_request_with_retry(client, "POST", CHAT_API_URL, json=payload, headers=headers, timeout=120)
-
-                if response == "RETRY_WITH_NEW_CLIENT":
-                    app.logger.info("Retrying request with fresh cookies...")
-                    async with httpx.AsyncClient(headers=BASE_HEADERS, cookies=GLOBAL_COOKIES, timeout=30, follow_redirects=True) as retry_client:
-                        response = await make_request_with_retry(retry_client, "POST", CHAT_API_URL, json=payload, headers=headers, timeout=120)
-
-                if response is None or response == "RETRY_WITH_NEW_CLIENT":
-                    return create_openai_error_response("上游API请求失败。", status_code=502)
-
-                full_content = []
-                # The response body is already fully in memory for non-streaming requests
-                for line in response.text.splitlines():
-                     if line.startswith("0:"):
-                        full_content.append(json.loads(line[2:]))
+            async def stream_generator():
+                reader_task = asyncio.create_task(data_reader(temp_vs_chat_id, payload))
+                heartbeat_task = asyncio.create_task(heartbeat_sender())
                 
-                final_text = "".join(full_content)
-                # Cleanup after successful processing
-                await delete_chat_session(client, temp_vs_chat_id)
+                stream_usage_data = None
+                try:
+                    while True:
+                        item = await queue.get()
+                        if item is None: # End of stream from reader
+                            break
+                        
+                        if isinstance(item, Exception):
+                            raise item
 
-                return jsonify({
-                    "id": openai_msg_id, "object": "chat.completion", "created": int(time.time()), "model": model_requested,
-                    "choices": [{"message": {"role": "assistant", "content": final_text}, "index": 0, "finish_reason": "stop"}],
-                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-                })
+                        if item == ":heartbeat\n\n":
+                            yield item.encode('utf-8')
+                            continue
+                        
+                        line_content = item
+                        try:
+                            if line_content.startswith("e:") or line_content.startswith("d:"):
+                                json_data_str = line_content[2:]
+                                if json_data_str:
+                                    end_stream_data = json.loads(json_data_str)
+                                    if end_stream_data.get("usage"):
+                                        stream_usage_data = end_stream_data["usage"]
+                                break
+                            elif line_content.startswith("g:"):
+                                yield generate_stream_reasoning_response(json.loads(line_content[2:]), model_requested, openai_msg_id).encode('utf-8')
+                            elif line_content.startswith("0:"):
+                                yield generate_stream_response(json.loads(line_content[2:]), model_requested, openai_msg_id).encode('utf-8')
+                        
+                        except (json.JSONDecodeError, Exception) as e:
+                            app.logger.warning(f"处理流数据行时出错: {line_content}, Error: {e}")
+                            
+                    yield generate_stream_done(model_requested, openai_msg_id, stream_usage_data).encode('utf-8')
+                except asyncio.CancelledError:
+                    app.logger.warning(f"客户端 for chat {temp_vs_chat_id} 断开连接。")
+                finally:
+                    heartbeat_task.cancel()
+                    reader_task.cancel() # Ensure reader task is cancelled
+                    await delete_chat_session(temp_vs_chat_id)
+            
+            response_to_return = Response(stream_generator(), mimetype='text/event-stream') # type: ignore
+        else: # Non-streaming logic remains the same
+            api_response = await make_request_with_retry("POST", CHAT_API_URL, json=payload, headers=chat_api_headers, timeout=None)
+            if not api_response or api_response.status_code != 200:
+                raise Exception("上游API请求失败或响应无效。")
+            
+            full_response_content, non_stream_usage_info = [], None
+            for line_item in api_response.text.splitlines():
+                if line_item.startswith("0:"):
+                    full_response_content.append(json.loads(line_item[2:]))
+                elif (line_item.startswith("e:") or line_item.startswith("d:")) and (json_data_str := line_item[2:]):
+                    try:
+                        end_signal_data = json.loads(json_data_str)
+                        if "usage" in end_signal_data: non_stream_usage_info = end_signal_data["usage"]
+                    except json.JSONDecodeError: pass
+            
+            final_response_text = "".join(full_response_content)
+            response_to_return = jsonify({
+                "id": openai_msg_id, "object": "chat.completion", "created": int(time.time()), "model": model_requested,
+                "choices": [{"message": {"role": "assistant", "content": final_response_text}, "index": 0, "finish_reason": "stop"}],
+                "usage": non_stream_usage_info or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+            })
 
-        except Exception as e:
-            app.logger.error(f"处理请求时发生错误: {e}", exc_info=True)
-            if temp_vs_chat_id:
-                # Use a new client for cleanup in case the original one is in a bad state.
-                async with httpx.AsyncClient(headers=BASE_HEADERS, cookies=GLOBAL_COOKIES) as cleanup_client:
-                    await delete_chat_session(cleanup_client, temp_vs_chat_id)
-            return create_openai_error_response(f"内部服务器错误: {str(e)}", status_code=500)
+    except Exception as e:
+        app.logger.error(f"处理聊天请求时发生错误: {e}", exc_info=True)
+        if stream:
+            async def error_stream():
+                yield f"data: {json.dumps(create_manual_openai_error_chunk(str(e)))}\n\n".encode('utf-8')
+            return Response(error_stream(), mimetype='text/event-stream', status=500) # type: ignore
+        else:
+            return create_openai_error_response(str(e), status_code=500)
+    finally:
+        if not stream and temp_vs_chat_id:
+            await delete_chat_session(temp_vs_chat_id)
+
+    return response_to_return
+
+@app.route('/v1/chat/completions', methods=['POST'])
+async def chat_completions() -> typing.Union[Response, tuple[Response, int]]:
+    await initialization_complete.wait() # This should pass quickly once server starts
+
+    # Check if background login/setup is still pending
+    if not login_pending.is_set(): # login_pending is clear() if task is running
+        app.logger.info("后台认证/设置仍在进行中，请等待片刻...")
+        try:
+            # Wait for the background task to complete, with a timeout
+            await asyncio.wait_for(login_pending.wait(), timeout=15.0) # login_pending.wait() waits until set()
+        except asyncio.TimeoutError:
+            app.logger.warning("等待后台认证/设置超时。服务可能尚未完全就绪。")
+            return create_openai_error_response("服务正在进行初始设置，请稍后重试。", status_code=503) # Service Unavailable
+
+    # After waiting (or if it wasn't pending), check the actual cookie validity
+    if not cookies_are_genuinely_valid:
+        app.logger.error("无法处理聊天请求：Cookies 无效或后台认证失败。")
+        return create_openai_error_response("认证信息无效或后台初始化失败，无法处理请求。请检查服务器日志。", status_code=503)
+
+    # If we reach here, background task is done (or wasn't running) AND cookies are valid.
+    try:
+        data = await request.get_json()
+        if not data:
+            return create_openai_error_response("请求体不是有效的JSON，或为空。", status_code=400)
+        if not data.get("messages"): # Ensure messages list is present
+            return create_openai_error_response("请求体中缺少必需的 `messages` 属性。", status_code=400)
+        
+        return await handle_chat_request(data)
+
+    except httpx.RequestError as e_req: # Catch network errors from handle_chat_request or its sub-calls
+        app.logger.error(f"处理聊天完成请求时发生网络连接错误: {type(e_req).__name__} - {e_req}", exc_info=True)
+        return create_openai_error_response(f"上游服务网络连接错误: {e_req}", status_code=502) # Bad Gateway
+    except Exception as e_general: # Catch-all for other unexpected errors
+        app.logger.error(f"处理聊天完成请求时发生未知错误: {type(e_general).__name__} - {e_general}", exc_info=True)
+        return create_openai_error_response(f"内部服务器错误: {e_general}", status_code=500)
 
 
 @app.route('/v1/models', methods=['GET'])
-def get_models_endpoint():
+async def get_models_endpoint():
     models = [{"id": k, "object": "model", "owned_by": "vsp-text", "permission": []} for k in MODEL_MAPPING.keys()]
     return jsonify({"data": models, "object": "list"})
 
-async def main():
-    # 在程序启动时执行初始化
+# --- Server Startup & Shutdown ---
+@app.before_serving
+async def startup():
+    global HTTP_CLIENT
+    # Initialize the global HTTP client first
+    # Cookies will be added to it by initialize() or background_login_and_setup() via login_and_get_cookies()
+    HTTP_CLIENT = httpx.AsyncClient(headers=BASE_HEADERS, timeout=DEFAULT_REQUEST_TIMEOUT, follow_redirects=True)
+    app.logger.info("全局 HTTP_CLIENT 已在启动时创建。")
+
+    # Run the main initialization logic. This will set initialization_complete event quickly.
+    # Actual login might happen in the background.
     await initialize()
-    
-    # 初始化完成后，再启动 ASGI 服务器
-    from hypercorn.config import Config
-    from hypercorn.asyncio import serve as hypercorn_serve
+    # Log after initialize() has run, which sets initialization_complete
+    app.logger.info("服务核心启动流程完成。可开始接受请求。后台任务可能仍在运行。")
 
-    config = Config()
-    app_port = int(os.environ.get("PORT", 7860))
-    config.bind = [f"0.0.0.0:{app_port}"]
-    config.graceful_timeout = 5  # 设置优雅关闭的超时时间
-    app.logger.info(f"服务器正在 http://0.0.0.0:{app_port} 上启动...")
-    await hypercorn_serve(app, config)
+@app.after_serving
+async def shutdown():
+    global HTTP_CLIENT
+    if HTTP_CLIENT:
+        app.logger.info("正在关闭全局 HTTP_CLIENT...")
+        await HTTP_CLIENT.aclose()
+        HTTP_CLIENT = None
+        app.logger.info("全局 HTTP_CLIENT 已关闭。")
+    app.logger.info("服务器已关闭。")
 
-
-if __name__ == '__main__':
-    # 设置Windows特定的asyncio事件循环策略以避免常见错误
+if __name__ == "__main__":
+    # Force UTF-8 encoding on Windows for stdio streams
     if sys.platform == "win32":
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        os.environ["PYTHONIOENCODING"] = "utf-8"
+
+    # Create a Hypercorn configuration object
+    config = Config()
+    port = int(os.environ.get("PORT", 7860))
+    config.bind = [f"0.0.0.0:{port}"]
+    config.keep_alive_timeout = 3600.0
+    config.read_timeout = 3600
+    # 添加这些关键配置
+    config.worker_class = "asyncio"  # 确保使用asyncio工作模式
+
+    app.config['RESPONSE_TIMEOUT'] = 3600  # 设置Quart的响应超时
     
-    # 运行主异步函数
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        app.logger.info("服务器被手动中断。")
+    # Run the app with Hypercorn asyncio server
+    asyncio.run(serve(app, config))

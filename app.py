@@ -298,41 +298,7 @@ def generate_stream_reasoning_response(reasoning_chunk, model, message_id):
                   "choices": [{"delta": {"reasoning_content": reasoning_chunk}, "index": 0, "finish_reason": None}]}
     return f"data: {json.dumps(chunk_data)}\n\n"
 
-import queue
-import threading
 
-def stream_async_generator(async_gen):
-    """
-    Wraps an async generator to be used in a synchronous context (like Flask/Waitress).
-    It runs the async generator in a separate thread and uses a queue to pass
-    items back to the synchronous caller, ensuring true, item-by-item streaming.
-    """
-    q = queue.Queue()
-    _sentinel = object()
-
-    def run_in_thread():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            async def iterate_and_put():
-                async for item in async_gen:
-                    q.put(item)
-            
-            loop.run_until_complete(iterate_and_put())
-        finally:
-            q.put(_sentinel)
-            loop.close()
-
-    thread = threading.Thread(target=run_in_thread)
-    thread.start()
-
-    while True:
-        item = q.get()
-        if item is _sentinel:
-            break
-        yield item
-    
-    thread.join()
 
 def build_prompt_with_history_and_instructions(messages_array):
     if not messages_array: return ""
@@ -441,7 +407,7 @@ async def chat_completions():
                                 await delete_chat_session(cleanup_client, temp_vs_chat_id)
                                 temp_vs_chat_id = None
 
-                return Response(stream_async_generator(stream_proxy_generator()), mimetype="text/event-stream")
+                return Response(stream_proxy_generator(), mimetype="text/event-stream")
 
             # Handle non-streaming case
             else:
@@ -488,17 +454,26 @@ def get_models_endpoint():
 async def main():
     # 在程序启动时执行初始化
     await initialize()
+    
+    # 初始化完成后，再启动 ASGI 服务器
+    from hypercorn.config import Config
+    from hypercorn.asyncio import serve as hypercorn_serve
+
+    config = Config()
+    app_port = int(os.environ.get("PORT", 7860))
+    config.bind = [f"0.0.0.0:{app_port}"]
+    config.graceful_timeout = 5  # 设置优雅关闭的超时时间
+    app.logger.info(f"服务器正在 http://0.0.0.0:{app_port} 上启动...")
+    await hypercorn_serve(app, config)
+
 
 if __name__ == '__main__':
     # 设置Windows特定的asyncio事件循环策略以避免常见错误
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     
-    # 首先完成异步初始化
-    asyncio.run(main())
-
-    # 初始化完成后，再启动Web服务器
-    from waitress import serve
-    app_port = int(os.environ.get("PORT", 7860))
-    app.logger.info(f"服务器正在 http://0.0.0.0:{app_port} 上启动...")
-    serve(app, host='0.0.0.0', port=app_port, threads=16)
+    # 运行主异步函数
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        app.logger.info("服务器被手动中断。")

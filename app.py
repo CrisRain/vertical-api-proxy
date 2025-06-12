@@ -14,6 +14,8 @@ import asyncio
 import time
 import logging
 import base64
+import queue
+import threading
 
 app = Flask(__name__)
 # --- Logging Configuration ---
@@ -368,9 +370,11 @@ async def chat_completions():
             headers = {"Content-Type": "application/json", "Referer": f"{STREAM_CORNERS_BASE_URL}/{TEXT_CORNER_TYPE}/{temp_vs_chat_id}"}
             
             if stream:
-                async def stream_proxy_generator():
-                    # This generator is self-contained. It creates its own client
-                    # and does not rely on the app context for error generation.
+                data_queue = queue.Queue()
+
+                async def producer():
+                    # This async producer runs the original async generator
+                    # and puts the data into a thread-safe queue.
                     nonlocal temp_vs_chat_id
                     client_for_stream = httpx.AsyncClient(headers=BASE_HEADERS, cookies=GLOBAL_COOKIES, timeout=30, follow_redirects=True)
                     try:
@@ -380,34 +384,47 @@ async def chat_completions():
                                 error_msg = f"Upstream API error: {response.status_code} - {error_body.decode()}"
                                 app.logger.error(error_msg)
                                 error_chunk = create_manual_openai_error_chunk(error_msg)
-                                yield f"data: {json.dumps(error_chunk)}\n\n"
+                                data_queue.put(f"data: {json.dumps(error_chunk)}\n\n")
                                 return
 
                             async for line in response.aiter_lines():
                                 if line.startswith("0:"):
                                     chunk = json.loads(line[2:])
-                                    yield generate_stream_response(chunk, model_requested, openai_msg_id)
+                                    data_queue.put(generate_stream_response(chunk, model_requested, openai_msg_id))
                                 elif line.startswith("g:"):
                                     chunk = json.loads(line[2:])
-                                    yield generate_stream_reasoning_response(chunk, model_requested, openai_msg_id)
+                                    data_queue.put(generate_stream_reasoning_response(chunk, model_requested, openai_msg_id))
                             
-                            yield generate_stream_done(model_requested, openai_msg_id)
-                            yield "data: [DONE]\n\n"
-                    
+                            data_queue.put(generate_stream_done(model_requested, openai_msg_id))
+                            data_queue.put("data: [DONE]\n\n")
+
                     except Exception as e:
                         app.logger.error(f"Error during stream proxy: {e}", exc_info=True)
                         error_chunk = create_manual_openai_error_chunk(f"Internal stream error: {e}")
-                        yield f"data: {json.dumps(error_chunk)}\n\n"
+                        data_queue.put(f"data: {json.dumps(error_chunk)}\n\n")
                     
                     finally:
                         await client_for_stream.aclose()
                         if temp_vs_chat_id:
-                            # Use a new, dedicated client for cleanup.
                             async with httpx.AsyncClient(headers=BASE_HEADERS, cookies=GLOBAL_COOKIES) as cleanup_client:
                                 await delete_chat_session(cleanup_client, temp_vs_chat_id)
                                 temp_vs_chat_id = None
+                        data_queue.put(None)  # Signal that we are done.
 
-                return Response(stream_proxy_generator(), mimetype="text/event-stream")
+                def consumer():
+                    # This sync consumer pulls data from the queue and yields it.
+                    # This is what Flask's Response object will interact with.
+                    while True:
+                        item = data_queue.get()
+                        if item is None:
+                            break
+                        yield item
+
+                # Run the async producer in a separate daemon thread.
+                thread = threading.Thread(target=lambda: asyncio.run(producer()), daemon=True)
+                thread.start()
+
+                return Response(consumer(), mimetype="text/event-stream")
 
             # Handle non-streaming case
             else:

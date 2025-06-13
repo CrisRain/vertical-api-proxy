@@ -84,6 +84,7 @@ login_pending = asyncio.Event() # Signals if a background login/setup task is ac
 login_pending.set() # Initialize as idle
 cookies_are_genuinely_valid = False # Tracks if cookies are verified and usable
 HTTP_CLIENT: typing.Optional[httpx.AsyncClient] = None # Global HTTP client
+PROXY_CONFIG: typing.Optional[dict] = None # Global proxy config
 
 def load_credentials():
     dotenv.load_dotenv(".env")
@@ -94,6 +95,18 @@ def load_credentials():
         return None, None
     app.logger.info("成功从环境变量加载凭据。")
     return email, password
+
+def load_proxy_config():
+    global PROXY_CONFIG
+    proxy_url = os.getenv("PROXY")
+    if proxy_url:
+        PROXY_CONFIG = {
+            "http://": proxy_url,
+            "https://": proxy_url,
+        }
+        app.logger.info(f"通用代理已配置，将用于所有请求: {proxy_url}")
+    else:
+        app.logger.info("未找到 PROXY 环境变量，跳过代理设置。")
 
 async def load_cookies_from_file():
     global COOKIE_LAST_REFRESH, GLOBAL_COOKIES
@@ -131,7 +144,7 @@ async def login_and_get_cookies(email, password):
     app.logger.info("正在尝试登录...")
     try:
         # Use a temporary client for the login process to avoid altering global client's state prematurely
-        async with httpx.AsyncClient(headers=BASE_HEADERS, timeout=30, follow_redirects=True) as login_client:
+        async with httpx.AsyncClient(headers=BASE_HEADERS, timeout=30, follow_redirects=True, proxies=PROXY_CONFIG) as login_client:
             await login_client.get(LOGIN_URL)
             email_encoded = urlencode({"email": email})
             login_password_url = f"{LOGIN_PASSWORD_DATA_URL}?{email_encoded}"
@@ -202,7 +215,7 @@ async def create_new_chat_session(corner_type=TEXT_CORNER_TYPE): # Removed clien
         # This specific GET in original code used follow_redirects=False and parsed Location header.
         # We need a client instance that has follow_redirects=False for this step.
         # It's safer to create a temporary client for this specific request if global HTTP_CLIENT follows redirects.
-        async with httpx.AsyncClient(headers=BASE_HEADERS, cookies=GLOBAL_COOKIES, timeout=30, follow_redirects=False) as temp_redirect_client:
+        async with httpx.AsyncClient(headers=BASE_HEADERS, cookies=GLOBAL_COOKIES, timeout=30, follow_redirects=False, proxies=PROXY_CONFIG) as temp_redirect_client:
             response_get_corner = await temp_redirect_client.get(specific_corner_data_url)
 
         new_chat_id = None
@@ -337,6 +350,7 @@ async def background_login_and_setup(email, password):
 async def initialize():
     global cookies_are_genuinely_valid, COOKIE_LAST_REFRESH, GLOBAL_COOKIES, HTTP_CLIENT
 
+    load_proxy_config() # Load proxy settings at startup
     email, password = load_credentials()
     if not (email and password):
         app.logger.critical("未能加载凭据，无法继续初始化。程序退出。")
@@ -501,7 +515,7 @@ async def handle_chat_request(data) -> typing.Union[Response, tuple[Response, in
 
             async def data_reader(target_chat_id, stream_payload_data):
                 try:
-                    async with httpx.AsyncClient(headers=BASE_HEADERS, cookies=GLOBAL_COOKIES, timeout=None, follow_redirects=False) as client:
+                    async with httpx.AsyncClient(headers=BASE_HEADERS, cookies=GLOBAL_COOKIES, timeout=None, follow_redirects=False, proxies=PROXY_CONFIG) as client:
                         async with client.stream("POST", CHAT_API_URL, json=stream_payload_data, headers=chat_api_headers) as response:
                             if response.status_code != 200:
                                 error_body = await response.aread()
@@ -653,7 +667,7 @@ async def startup():
     global HTTP_CLIENT
     # Initialize the global HTTP client first
     # Cookies will be added to it by initialize() or background_login_and_setup() via login_and_get_cookies()
-    HTTP_CLIENT = httpx.AsyncClient(headers=BASE_HEADERS, timeout=DEFAULT_REQUEST_TIMEOUT, follow_redirects=True)
+    HTTP_CLIENT = httpx.AsyncClient(headers=BASE_HEADERS, timeout=DEFAULT_REQUEST_TIMEOUT, follow_redirects=True, proxies=PROXY_CONFIG)
     app.logger.info("全局 HTTP_CLIENT 已在启动时创建。")
 
     # Run the main initialization logic. This will set initialization_complete event quickly.

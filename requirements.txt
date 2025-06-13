@@ -1,6 +1,6 @@
 aiofiles==24.1.0
 Brotli==1.1.0
-httpx==0.28.1
+httpx[socks,brotli]==0.28.1
 hypercorn==0.17.3
 python-dotenv==1.1.0
 quart==0.20.0

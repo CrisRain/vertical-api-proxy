@@ -69,6 +69,11 @@ VS_PASSWORD="your_password"
 
 # 可选：自定义服务运行的端口
 PORT=7860
+|
+# 可选：为所有出站请求配置一个通用代理
+# 支持 HTTP/HTTPS/SOCKS 代理
+# PROXY="http://user:pass@host:port"
+# PROXY="socks5://user:pass@host:port"
 ```
 
 ### 3. 安装依赖
@@ -168,6 +173,7 @@ print()
 | `VS_EMAIL`    | **必需**，您的登录邮箱。       | -      |
 | `VS_PASSWORD` | **必需**，您的登录密码。       | -      |
 | `PORT`        | 服务监听的端口。               | `7860` |
+| `PROXY`       | 为所有出站请求设置的通用代理。 | -      |
 
 ---
 
